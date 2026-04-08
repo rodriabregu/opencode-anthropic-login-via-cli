@@ -13,6 +13,7 @@ import {
   isExpiringSoon,
 } from "./credentials.ts";
 import { transformRequestBody, createToolNameUnprefixStream } from "./transforms.ts";
+import { rewriteOrigin, isInsecure } from "./proxy.ts";
 
 interface AuthState {
   type: string;
@@ -86,7 +87,7 @@ export function createCustomFetch(getAuth: () => Promise<AuthState>, client: Cli
     reqHeaders.set("x-app", "cli");
     reqHeaders.delete("x-api-key");
 
-    const reqInput = addBetaParam(input);
+    const reqInput = rewriteOrigin(addBetaParam(input));
 
     log.debug("Outgoing request", {
       model: modelId,
@@ -97,7 +98,8 @@ export function createCustomFetch(getAuth: () => Promise<AuthState>, client: Cli
       ...init,
       body,
       headers: reqHeaders,
-    });
+      ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
+    } as RequestInit);
 
     if (response.status === 429 || response.status === 529 || response.status === 401) {
       response = await handleRetryableError(response, auth, client, reqInput, {
