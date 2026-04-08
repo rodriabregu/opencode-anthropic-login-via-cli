@@ -25,6 +25,11 @@ interface AuthState {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type ClientApi = any;
 
+/** Bun extends RequestInit with a tls option for custom certificate handling. */
+type BunFetchRequestInit = RequestInit & {
+  tls?: { rejectUnauthorized: boolean };
+};
+
 function isLongContextError(body: string): boolean {
   return (
     body.includes("Extra usage is required for long context requests") ||
@@ -94,19 +99,22 @@ export function createCustomFetch(getAuth: () => Promise<AuthState>, client: Cli
       betaCount: merged.split(",").length,
     });
 
+    const tlsOpts = isInsecure() ? { tls: { rejectUnauthorized: false } } : {};
+
     let response = await fetch(reqInput, {
       ...init,
       body,
       headers: reqHeaders,
-      ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
-    } as RequestInit);
+      ...tlsOpts,
+    } as BunFetchRequestInit);
 
     if (response.status === 429 || response.status === 529 || response.status === 401) {
       response = await handleRetryableError(response, auth, client, reqInput, {
         ...init,
         body,
         headers: reqHeaders,
-      });
+        ...tlsOpts,
+      } as BunFetchRequestInit);
     }
 
     if (response.body) {
@@ -281,7 +289,7 @@ async function handleRetryableError(
     headers.set("authorization", `Bearer ${freshCreds.access}`);
 
     log.info("Retrying with fresh credentials");
-    return fetch(reqInput, { ...reqInit, headers });
+    return fetch(reqInput, { ...reqInit, headers } as BunFetchRequestInit);
   }
 
   return new Response(responseBody, {

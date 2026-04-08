@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { resolveBaseUrl, isInsecure, rewriteOrigin } from "../src/proxy.ts";
+import { resolveBaseUrl, isInsecure, rewriteOrigin, resetProxyCache } from "../src/proxy.ts";
 
 describe("resolveBaseUrl", () => {
   afterEach(() => {
     delete process.env.ANTHROPIC_BASE_URL;
+    resetProxyCache();
   });
 
   it("returns null when env var is unset", () => {
@@ -46,6 +47,11 @@ describe("resolveBaseUrl", () => {
     expect(resolveBaseUrl()).toBeNull();
   });
 
+  it("rejects URLs with a path component", () => {
+    process.env.ANTHROPIC_BASE_URL = "https://proxy.example.com/anthropic";
+    expect(resolveBaseUrl()).toBeNull();
+  });
+
   it("trims whitespace", () => {
     process.env.ANTHROPIC_BASE_URL = "  https://proxy.example.com  ";
     const url = resolveBaseUrl();
@@ -58,6 +64,7 @@ describe("isInsecure", () => {
   afterEach(() => {
     delete process.env.ANTHROPIC_BASE_URL;
     delete process.env.ANTHROPIC_INSECURE;
+    resetProxyCache();
   });
 
   it("returns false when ANTHROPIC_BASE_URL is unset", () => {
@@ -92,6 +99,7 @@ describe("isInsecure", () => {
 describe("rewriteOrigin", () => {
   afterEach(() => {
     delete process.env.ANTHROPIC_BASE_URL;
+    resetProxyCache();
   });
 
   it("returns input unchanged when no base URL is set", () => {

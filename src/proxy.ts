@@ -1,14 +1,23 @@
 import { log } from "./logger.ts";
 
+let _resolved: URL | null | undefined;
+let _logged = false;
+
 /**
  * Parse ANTHROPIC_BASE_URL from the environment.
  * Returns a valid HTTP(S) URL or null if unset/invalid.
  *
- * Rejects URLs with embedded credentials (user:pass@host) for safety.
+ * Rejects URLs with embedded credentials or non-empty paths for safety.
+ * Result is cached for the process lifetime.
  */
 export function resolveBaseUrl(): URL | null {
+  if (_resolved !== undefined) return _resolved;
+
   const raw = process.env.ANTHROPIC_BASE_URL?.trim();
-  if (!raw) return null;
+  if (!raw) {
+    _resolved = null;
+    return null;
+  }
 
   try {
     const url = new URL(raw);
@@ -16,17 +25,46 @@ export function resolveBaseUrl(): URL | null {
       log.warn("ANTHROPIC_BASE_URL has unsupported protocol, ignoring", {
         protocol: url.protocol,
       });
+      _resolved = null;
       return null;
     }
     if (url.username || url.password) {
       log.warn("ANTHROPIC_BASE_URL contains credentials, ignoring for safety");
+      _resolved = null;
       return null;
     }
+    if (url.pathname !== "/" && url.pathname !== "") {
+      log.warn("ANTHROPIC_BASE_URL contains a path which would be ignored — use origin only", {
+        url: raw,
+        hint: `Try ${url.origin} instead`,
+      });
+      _resolved = null;
+      return null;
+    }
+    _resolved = url;
+
+    if (!_logged) {
+      log.info("Proxy configured", {
+        baseUrl: url.origin,
+        insecure: isInsecure(),
+      });
+      _logged = true;
+    }
+
     return url;
   } catch {
     log.warn("ANTHROPIC_BASE_URL is not a valid URL, ignoring", { raw });
+    _resolved = null;
     return null;
   }
+}
+
+/**
+ * Reset cached state. Only needed for tests.
+ */
+export function resetProxyCache(): void {
+  _resolved = undefined;
+  _logged = false;
 }
 
 /**
@@ -75,7 +113,8 @@ export function rewriteOrigin(input: RequestInfo | URL): RequestInfo | URL {
     });
 
     return input instanceof Request ? new Request(reqUrl.toString(), input) : reqUrl;
-  } catch {
+  } catch (e) {
+    log.warn("Failed to rewrite request origin", { error: String(e) });
     return input;
   }
 }
