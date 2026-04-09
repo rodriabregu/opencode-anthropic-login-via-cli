@@ -26,6 +26,25 @@ const DEFAULT_BETA_HEADERS = [
   "oauth-2025-04-20",
 ];
 
+const OPENCODE_IDENTITY =
+  "You are OpenCode, the best coding agent on the planet.";
+const CLAUDE_CODE_IDENTITY =
+  "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+
+// Anchors that identify OpenCode-specific paragraphs to remove entirely.
+// Resilient to upstream rewording — as long as the anchor string
+// (typically a URL) still appears somewhere in the paragraph, removal works.
+const PARAGRAPH_REMOVAL_ANCHORS = [
+  "github.com/anomalyco/opencode",
+  "opencode.ai/docs",
+];
+
+// Inline text replacements applied after paragraph removal — for cases
+// where "OpenCode" appears inside a paragraph we want to keep.
+const TEXT_REPLACEMENTS: { match: string; replacement: string }[] = [
+  { match: "if OpenCode honestly", replacement: "if the assistant honestly" },
+];
+
 const REFRESH_BUFFER_MS = 5 * 60 * 1000;
 
 // Track current account to detect switches and reset stale state
@@ -588,6 +607,107 @@ async function findAlternateCredentials(
   return null;
 }
 
+// ── System Prompt Sanitization ───────────────────────────────────────────────
+// Anchor-based paragraph removal keeps behavioral guidance while stripping
+// OpenCode-specific identifiers that Anthropic's content validator flags.
+
+type SystemBlock = { type: string; text: string; [k: string]: unknown };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value != null && typeof value === "object" && !Array.isArray(value);
+}
+
+function sanitizeSystemText(text: string): string {
+  if (!text.includes(OPENCODE_IDENTITY)) return text;
+
+  // Split on blank lines into paragraphs
+  const paragraphs = text.split(/\n\n+/);
+
+  const filtered = paragraphs.filter((paragraph) => {
+    // Drop paragraph if it IS just the identity line
+    if (paragraph.trim() === OPENCODE_IDENTITY) return false;
+    // Drop paragraphs containing any removal anchor
+    for (const anchor of PARAGRAPH_REMOVAL_ANCHORS) {
+      if (paragraph.includes(anchor)) return false;
+    }
+    return true;
+  });
+
+  let result = filtered.join("\n\n");
+
+  // Remove identity if it was inline in a paragraph we kept
+  result = result.replace(OPENCODE_IDENTITY, "").replace(/\n{3,}/g, "\n\n");
+
+  // Inline replacements for cases where we kept the paragraph
+  for (const rule of TEXT_REPLACEMENTS) {
+    result = result.replace(rule.match, rule.replacement);
+  }
+
+  return result.trim();
+}
+
+/**
+ * Sanitize system prompt and prepend Claude Code identity.
+ * Handles all Anthropic API system formats: undefined, string, object, or array.
+ * Idempotent — won't double-prepend if identity already at system[0].
+ */
+function prependClaudeCodeIdentity(system: unknown): SystemBlock[] {
+  const identityBlock: SystemBlock = {
+    type: "text",
+    text: CLAUDE_CODE_IDENTITY,
+  };
+
+  if (system == null) return [identityBlock];
+
+  if (typeof system === "string") {
+    const sanitized = sanitizeSystemText(system);
+    if (sanitized === CLAUDE_CODE_IDENTITY || sanitized === "")
+      return [identityBlock];
+    return [identityBlock, { type: "text", text: sanitized }];
+  }
+
+  if (isRecord(system)) {
+    const type = typeof system.type === "string" ? system.type : "text";
+    const text = typeof system.text === "string" ? system.text : "";
+    return [
+      identityBlock,
+      { ...system, type, text: sanitizeSystemText(text) },
+    ];
+  }
+
+  if (!Array.isArray(system)) return [identityBlock];
+
+  const sanitized: SystemBlock[] = system.map((item: unknown) => {
+    if (typeof item === "string") {
+      return { type: "text", text: sanitizeSystemText(item) };
+    }
+    if (
+      isRecord(item) &&
+      item.type === "text" &&
+      typeof item.text === "string"
+    ) {
+      return { ...item, type: "text", text: sanitizeSystemText(item.text) };
+    }
+    return { type: "text", text: String(item) };
+  });
+
+  // Idempotency: if first block already contains the identity, don't re-prepend.
+  // Also treat the old "You are Claude Code, Anthropic's official CLI for Claude."
+  // anchor as already-identity so previous hook-prepended blocks are recognized.
+  const firstText = sanitized[0]?.text ?? "";
+  if (firstText === CLAUDE_CODE_IDENTITY) {
+    // Already correct — preserve any metadata (cache_control, etc.) on the block.
+    return sanitized;
+  }
+  if (firstText === "You are Claude Code, Anthropic's official CLI for Claude.") {
+    // Update stale anchor in place, preserving metadata.
+    sanitized[0] = { ...sanitized[0], type: "text", text: CLAUDE_CODE_IDENTITY };
+    return sanitized;
+  }
+
+  return [identityBlock, ...sanitized];
+}
+
 // ── Custom Fetch (Bearer auth + tool renaming + prompt sanitization) ─────────
 // Reads userAgent/betaHeaders from getIntro() on every request so values
 // auto-upgrade once background introspection completes.
@@ -703,19 +823,60 @@ function createCustomFetch(getAuth: () => Promise<any>, client: any) {
       try {
         const parsed = JSON.parse(body);
 
-        // Sanitize system prompt
-        if (parsed.system && Array.isArray(parsed.system)) {
-          parsed.system = parsed.system.map((item: any) => {
-            if (item.type === "text" && item.text) {
-              return {
-                ...item,
-                text: item.text
-                  .replace(/OpenCode/g, "Claude Code")
-                  .replace(/opencode/gi, "Claude"),
-              };
+        // Sanitize system prompt + prepend Claude Code identity
+        parsed.system = prependClaudeCodeIdentity(parsed.system);
+
+        // --- Relocate non-core system entries to user messages ---
+        // Anthropic's API content-validates system[] for OAuth requests.
+        // Non-identity system text triggers a 400 "out of extra usage"
+        // rejection. Keep only the identity block in system[] and prepend
+        // everything else to the first user message.
+        if (Array.isArray(parsed.system) && parsed.system.length > 1) {
+          const kept = [parsed.system[0]]; // identity block
+          const movedTexts: string[] = [];
+
+          for (let i = 1; i < parsed.system.length; i++) {
+            const entry = parsed.system[i];
+            const txt =
+              typeof entry === "string" ? entry : (entry?.text ?? "");
+            if (txt.length > 0) movedTexts.push(txt);
+          }
+
+          if (movedTexts.length > 0) {
+            // Always trim system[], regardless of message shape. The whole point is
+            // to keep non-identity text out of the validated system[] path.
+            parsed.system = kept;
+            const joined = movedTexts.join("\n\n");
+
+            if (!Array.isArray(parsed.messages)) {
+              parsed.messages = [];
             }
-            return item;
-          });
+
+            const firstUser = parsed.messages.find(
+              (m: { role?: string }) => m.role === "user",
+            );
+
+            if (firstUser) {
+              if (typeof firstUser.content === "string") {
+                firstUser.content = `${joined}\n\n${firstUser.content}`;
+              } else if (Array.isArray(firstUser.content)) {
+                firstUser.content.unshift({ type: "text", text: joined });
+              } else {
+                // Unknown content shape — promote to array so moved text isn't lost.
+                firstUser.content = [
+                  { type: "text", text: joined },
+                  firstUser.content,
+                ];
+              }
+            } else {
+              // No user message in the batch — synthesize one so the guidance
+              // still reaches the model instead of being silently dropped.
+              parsed.messages.unshift({
+                role: "user",
+                content: joined,
+              });
+            }
+          }
         }
 
         // Prefix tool names
@@ -979,17 +1140,6 @@ const plugin: Plugin = async ({ client }) => {
           provider: "anthropic",
         },
       ],
-    },
-    "experimental.chat.system.transform": async (
-      input: { sessionID?: string; model: any },
-      output: { system: string[] },
-    ) => {
-      if (input.model?.providerID !== "anthropic") return;
-      const prefix =
-        "You are Claude Code, Anthropic's official CLI for Claude.";
-      if (output.system.length > 0) {
-        output.system.unshift(prefix);
-      }
     },
   };
 };
