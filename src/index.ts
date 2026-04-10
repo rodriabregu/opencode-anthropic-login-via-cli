@@ -37,7 +37,6 @@ const plugin: Plugin = async ({ client }) => {
             setCurrentRefreshToken(auth.refresh);
           }
 
-          // zero out cost display for Pro/Max subscription
           for (const model of Object.values(provider.models) as any[]) {
             model.cost = {
               input: 0,
@@ -191,17 +190,6 @@ const plugin: Plugin = async ({ client }) => {
           provider: "anthropic",
         },
       ],
-    },
-
-    "experimental.chat.system.transform": async (
-      input: { sessionID?: string; model: any },
-      output: { system: string[] },
-    ) => {
-      if (input.model?.providerID !== "anthropic") return;
-      const prefix = "You are Claude Code, Anthropic's official CLI for Claude.";
-      if (output.system.length > 0) {
-        output.system.unshift(prefix);
-      }
     },
   };
 };

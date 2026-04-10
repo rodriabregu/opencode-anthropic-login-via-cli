@@ -1,6 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import { transformRequestBody, createToolNameUnprefixStream } from "../src/transforms.ts";
 
+const OPENCODE_IDENTITY = "You are OpenCode, the best coding agent on the planet.";
+const CLAUDE_CODE_IDENTITY = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+
 describe("transformRequestBody", () => {
   it("prefixes tool names with mcp_", () => {
     const input = JSON.stringify({
@@ -34,16 +37,80 @@ describe("transformRequestBody", () => {
     expect(parsed.messages[0].content[0].name).toBe("mcp_bash");
   });
 
-  it("replaces OpenCode with Claude Code in system prompts", () => {
+  it("relocates supported system text into the first user message", () => {
     const input = JSON.stringify({
       model: "claude-sonnet-4-20250514",
-      system: [{ type: "text", text: "You are OpenCode assistant." }],
+      system: [
+        {
+          type: "text",
+          text: `${OPENCODE_IDENTITY}\n\nSee github.com/anomalyco/opencode for docs.\n\nFollow team guardrails.`,
+        },
+        { type: "text", text: "Prefer deterministic output." },
+      ],
+      messages: [{ role: "user", content: "Build the handler." }],
     });
 
     const { body } = transformRequestBody(input);
     const parsed = JSON.parse(body);
 
-    expect(parsed.system[0].text).toBe("You are Claude Code assistant.");
+    expect(parsed.system).toEqual([{ type: "text", text: CLAUDE_CODE_IDENTITY }]);
+    expect(parsed.messages[0].content).toBe(
+      "Follow team guardrails.\n\nPrefer deterministic output.\n\nBuild the handler.",
+    );
+  });
+
+  it("synthesizes a user message when relocation has no user target", () => {
+    const input = JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      system: [{ type: "text", text: "Carry this instruction forward." }],
+      messages: [{ role: "assistant", content: "Ready." }],
+    });
+
+    const { body } = transformRequestBody(input);
+    const parsed = JSON.parse(body);
+
+    expect(parsed.system).toEqual([{ type: "text", text: CLAUDE_CODE_IDENTITY }]);
+    expect(parsed.messages[0]).toEqual({
+      role: "user",
+      content: "Carry this instruction forward.",
+    });
+    expect(parsed.messages[1].role).toBe("assistant");
+  });
+
+  it("does not leave empty system text blocks after sanitization", () => {
+    const input = JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      system: [{ type: "text", text: OPENCODE_IDENTITY }],
+      messages: [{ role: "user", content: "Hello" }],
+    });
+
+    const { body } = transformRequestBody(input);
+    const parsed = JSON.parse(body);
+
+    expect(parsed.system).toEqual([{ type: "text", text: CLAUDE_CODE_IDENTITY }]);
+    expect(parsed.messages[0].content).toBe("Hello");
+  });
+
+  it("does not stringify unsupported system entries into prompt text", () => {
+    const input = JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      system: [
+        { type: "text", text: "Supported instruction." },
+        { type: "image", text: "Should not leak." },
+        { type: "tool_result", content: [{ type: "text", text: "ignore" }] },
+        { arbitrary: "object" },
+      ],
+      messages: [{ role: "user", content: "Handle request." }],
+    });
+
+    const { body } = transformRequestBody(input);
+    const parsed = JSON.parse(body);
+    const firstUserText = parsed.messages[0].content as string;
+
+    expect(parsed.system).toEqual([{ type: "text", text: CLAUDE_CODE_IDENTITY }]);
+    expect(firstUserText).toBe("Supported instruction.\n\nHandle request.");
+    expect(firstUserText).not.toContain("[object Object]");
+    expect(firstUserText).not.toContain("Should not leak.");
   });
 
   it("returns raw body and null modelId on invalid JSON", () => {

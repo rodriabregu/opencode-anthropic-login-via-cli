@@ -75,6 +75,18 @@ export function createCustomFetch(getAuth: () => Promise<AuthState>, client: Cli
       const transformed = transformRequestBody(body);
       body = transformed.body;
       modelId = transformed.modelId;
+    } else if (
+      body === undefined &&
+      input instanceof Request &&
+      hasJsonContentType(reqHeaders.get("content-type"))
+    ) {
+      try {
+        const transformed = transformRequestBody(await input.clone().text());
+        body = transformed.body;
+        modelId = transformed.modelId;
+      } catch {
+        // ignore body-read failures and fall back to the original request body
+      }
     }
 
     const baseBetas = getBetaFlags(betaHeaders);
@@ -129,6 +141,11 @@ export function createCustomFetch(getAuth: () => Promise<AuthState>, client: Cli
 
     return response;
   };
+}
+
+function hasJsonContentType(contentType: string | null): boolean {
+  if (!contentType) return false;
+  return contentType.toLowerCase().includes("application/json");
 }
 
 function buildHeaders(input: RequestInfo | URL, init?: RequestInit): Headers {

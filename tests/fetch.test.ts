@@ -1,4 +1,5 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
+import { createCustomFetch } from "../src/fetch.ts";
 
 // these are not exported, so we test the logic inline
 function isLongContextError(body: string): boolean {
@@ -105,5 +106,75 @@ describe("Issue #5 — non-retryable 429 classification", () => {
     const is429 = false;
     const shouldRetry = !(is429 && (isLongContextError(body) || isBillingError(body)));
     expect(shouldRetry).toBe(true);
+  });
+});
+
+describe("createCustomFetch request-body transformation", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  function makeAuth() {
+    return {
+      type: "oauth",
+      access: "access-token",
+      expires: Date.now() + 10 * 60 * 1000,
+    };
+  }
+
+  it("transforms JSON body for URL + init string body", async () => {
+    let fetchInit: RequestInit | undefined;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      fetchInit = init;
+      return new Response("ok", { status: 200 });
+    }) as typeof fetch;
+
+    const customFetch = createCustomFetch(async () => makeAuth(), {
+      auth: { set: async () => {} },
+    });
+
+    const inputBody = JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      tools: [{ name: "bash" }],
+      messages: [{ role: "user", content: "Hello" }],
+    });
+
+    await customFetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: inputBody,
+    });
+
+    const parsed = JSON.parse(String(fetchInit?.body));
+    expect(parsed.tools[0].name).toBe("mcp_bash");
+  });
+
+  it("transforms JSON body for Request input body", async () => {
+    let fetchInit: RequestInit | undefined;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      fetchInit = init;
+      return new Response("ok", { status: 200 });
+    }) as typeof fetch;
+
+    const customFetch = createCustomFetch(async () => makeAuth(), {
+      auth: { set: async () => {} },
+    });
+
+    const request = new Request("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        tools: [{ name: "bash" }],
+        messages: [{ role: "user", content: "Hello" }],
+      }),
+    });
+
+    await customFetch(request);
+
+    const parsed = JSON.parse(String(fetchInit?.body));
+    expect(parsed.tools[0].name).toBe("mcp_bash");
   });
 });
