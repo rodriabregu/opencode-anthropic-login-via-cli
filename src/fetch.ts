@@ -1,6 +1,6 @@
 import { REFRESH_BUFFER_MS, type OAuthTokens } from "./constants.ts";
 import { log } from "./logger.ts";
-import { getIntro } from "./introspection.ts";
+import { awaitIntro } from "./introspection.ts";
 import { getBetasForModel, getBetaFlags } from "./model-config.ts";
 import {
   getCurrentRefreshToken,
@@ -44,7 +44,10 @@ function isBillingError(body: string): boolean {
 
 export function createCustomFetch(getAuth: () => Promise<AuthState>, client: ClientApi) {
   return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    const { userAgent, betaHeaders } = getIntro();
+    // Await introspection so the first request uses the real CLI version
+    // (for billing header, user-agent, betas) instead of DEFAULT_VERSION.
+    // After intro completes, this becomes a no-op (promise is cleared).
+    const { userAgent, betaHeaders } = await awaitIntro();
     const auth = await getAuth();
     if (auth.type !== "oauth") return fetch(input, init);
 

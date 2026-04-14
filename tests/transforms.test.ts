@@ -1,15 +1,16 @@
 import { describe, expect, it, mock } from "bun:test";
 import { transformRequestBody, createToolNameUnprefixStream } from "../src/transforms.ts";
 
+const INTRO_MOCK = {
+  version: "2.1.84",
+  userAgent: "claude-cli/2.1.84",
+  betaHeaders: [],
+  scopes: "",
+};
 mock.module("../src/introspection.ts", () => ({
-  getIntro: () => ({
-    version: "2.1.84",
-    userAgent: "claude-cli/2.1.84",
-    betaHeaders: [],
-    scopes: "",
-  }),
+  getIntro: () => INTRO_MOCK,
   startIntro: () => {},
-  awaitIntro: async () => {},
+  awaitIntro: async () => INTRO_MOCK,
 }));
 
 const OPENCODE_IDENTITY = "You are OpenCode, the best coding agent on the planet.";
