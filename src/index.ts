@@ -1,6 +1,7 @@
 import type { Plugin } from "@opencode-ai/plugin";
 import { log } from "./logger.ts";
-import { startIntro, getIntro, awaitIntro, getLatestCliVersion } from "./introspection.ts";
+import { DEFAULT_SCOPES } from "./constants.ts";
+import { getCliVersion, getUserAgent } from "./model-config.ts";
 import { createAuthorizationRequest, exchangeCodeForTokens } from "./pkce.ts";
 import {
   getCurrentRefreshToken,
@@ -17,9 +18,15 @@ import {
 } from "./credentials.ts";
 import { createCustomFetch } from "./fetch.ts";
 
+let cliVersion: string;
+let cliUserAgent: string;
+
 const plugin: Plugin = async ({ client }) => {
   log.info("Plugin initializing");
-  startIntro();
+
+  cliVersion = getCliVersion("2.1.84");
+  cliUserAgent = getUserAgent(cliVersion);
+  log.info("Using CLI identity", { version: cliVersion, userAgent: cliUserAgent });
 
   const ccsInstances = await discoverCCSInstances();
   log.info("Discovered CCS instances", { count: ccsInstances.length });
@@ -78,14 +85,9 @@ const plugin: Plugin = async ({ client }) => {
               };
             }
 
-            const latestVersion = getLatestCliVersion();
-            const versionWarning = latestVersion
-              ? `\n\n⚠️  Claude CLI is outdated (${getIntro().version} → ${latestVersion}). Run:\n  npm install -g @anthropic-ai/claude-code`
-              : "";
-
             return {
               url: "https://claude.ai",
-              instructions: `Detecting Claude Code credentials...${versionWarning}`,
+              instructions: "Detecting Claude Code credentials...",
               method: "auto" as const,
               async callback() {
                 let tokens = await readClaudeCodeCredentials();
@@ -151,7 +153,7 @@ const plugin: Plugin = async ({ client }) => {
           type: "oauth" as const,
           label: "Claude Pro/Max (browser)",
           async authorize() {
-            const { scopes } = await awaitIntro();
+            const scopes = process.env.ANTHROPIC_OAUTH_SCOPES?.trim() || DEFAULT_SCOPES;
             const { url, verifier } = createAuthorizationRequest(scopes);
             let exchangePromise: Promise<any> | null = null;
             return {
@@ -167,7 +169,7 @@ const plugin: Plugin = async ({ client }) => {
                     const tokens = await exchangeCodeForTokens(
                       code,
                       verifier,
-                      getIntro().userAgent,
+                      cliUserAgent,
                     );
                     return { type: "success" as const, ...tokens };
                   } catch (e) {

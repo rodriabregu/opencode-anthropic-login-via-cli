@@ -1,7 +1,17 @@
-import { REFRESH_BUFFER_MS, type OAuthTokens } from "./constants.ts";
+import { REFRESH_BUFFER_MS, DEFAULT_VERSION, type OAuthTokens } from "./constants.ts";
 import { log } from "./logger.ts";
-import { awaitIntro } from "./introspection.ts";
-import { getBetasForModel, getBetaFlags } from "./model-config.ts";
+import {
+  getBetasForModel,
+  getBetaFlags,
+  getCliVersion,
+  getUserAgent,
+  addExcludedBeta,
+  getNextBetaToExclude,
+  getExcludedBetas,
+  isLongContextError,
+  addCacheControlToBody,
+  LONG_CONTEXT_BETAS,
+} from "./model-config.ts";
 import {
   getCurrentRefreshToken,
   setCurrentRefreshToken,
@@ -22,32 +32,55 @@ interface AuthState {
   expires?: number;
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 type ClientApi = any;
 
-/** Bun extends RequestInit with a tls option for custom certificate handling. */
 type BunFetchRequestInit = RequestInit & {
   tls?: { rejectUnauthorized: boolean };
 };
-
-function isLongContextError(body: string): boolean {
-  return (
-    body.includes("Extra usage is required for long context requests") ||
-    body.includes("extra_usage") ||
-    body.includes("usage_limit_exceeded")
-  );
-}
 
 function isBillingError(body: string): boolean {
   return body.includes("billing_error");
 }
 
+const DEFAULT_MAX_RETRY_DELAY_MS = 30_000;
+
+function getMaxRetryDelayMs(): number {
+  const env = process.env.OPENCODE_CLAUDE_AUTH_MAX_RETRY_MS;
+  if (env) {
+    const parsed = parseInt(env, 10);
+    if (!Number.isNaN(parsed) && parsed > 0) return parsed;
+  }
+  return DEFAULT_MAX_RETRY_DELAY_MS;
+}
+
+function getArch(): string {
+  return process.arch === "arm64" ? "arm64" : process.arch;
+}
+
+function getOs(): string {
+  if (process.platform === "darwin") return "MacOS";
+  return process.platform;
+}
+
+function buildStainlessHeaders(): Record<string, string> {
+  return {
+    "x-stainless-arch": getArch(),
+    "x-stainless-lang": "js",
+    "x-stainless-os": getOs(),
+    "x-stainless-package-version": "0.81.0",
+    "x-stainless-retry-count": "0",
+    "x-stainless-runtime": "node",
+    "x-stainless-runtime-version": process.version,
+    "x-stainless-timeout": "600",
+  };
+}
+
+const cliVersion = getCliVersion(DEFAULT_VERSION);
+const cliUserAgent = getUserAgent(cliVersion);
+const stainlessHeaders = buildStainlessHeaders();
+
 export function createCustomFetch(getAuth: () => Promise<AuthState>, client: ClientApi) {
   return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    // Await introspection so the first request uses the real CLI version
-    // (for billing header, user-agent, betas) instead of DEFAULT_VERSION.
-    // After intro completes, this becomes a no-op (promise is cleared).
-    const { userAgent, betaHeaders } = await awaitIntro();
     const auth = await getAuth();
     if (auth.type !== "oauth") return fetch(input, init);
 
@@ -76,7 +109,7 @@ export function createCustomFetch(getAuth: () => Promise<AuthState>, client: Cli
 
     if (body && typeof body === "string") {
       const transformed = transformRequestBody(body);
-      body = transformed.body;
+      body = addCacheControlToBody(transformed.body);
       modelId = transformed.modelId;
     } else if (
       body === undefined &&
@@ -84,15 +117,14 @@ export function createCustomFetch(getAuth: () => Promise<AuthState>, client: Cli
       hasJsonContentType(reqHeaders.get("content-type"))
     ) {
       try {
-        const transformed = transformRequestBody(await input.clone().text());
-        body = transformed.body;
+        const raw = await input.clone().text();
+        const transformed = transformRequestBody(raw);
+        body = addCacheControlToBody(transformed.body);
         modelId = transformed.modelId;
-      } catch {
-        // ignore body-read failures and fall back to the original request body
-      }
+      } catch {}
     }
 
-    const baseBetas = getBetaFlags(betaHeaders);
+    const baseBetas = getBetaFlags();
     const modelBetas = modelId ? getBetasForModel(modelId, baseBetas) : baseBetas;
 
     const incoming = (reqHeaders.get("anthropic-beta") || "")
@@ -102,10 +134,16 @@ export function createCustomFetch(getAuth: () => Promise<AuthState>, client: Cli
     const merged = [...new Set([...modelBetas, ...incoming])].join(",");
 
     reqHeaders.set("authorization", `Bearer ${auth.access}`);
+    reqHeaders.set("anthropic-version", "2023-06-01");
     reqHeaders.set("anthropic-beta", merged);
-    reqHeaders.set("user-agent", userAgent);
+    reqHeaders.set("anthropic-dangerous-direct-browser-access", "true");
+    reqHeaders.set("user-agent", cliUserAgent);
     reqHeaders.set("x-app", "cli");
     reqHeaders.delete("x-api-key");
+
+    for (const [key, value] of Object.entries(stainlessHeaders)) {
+      if (!reqHeaders.has(key)) reqHeaders.set(key, value);
+    }
 
     const reqInput = rewriteOrigin(addBetaParam(input));
 
@@ -116,7 +154,7 @@ export function createCustomFetch(getAuth: () => Promise<AuthState>, client: Cli
 
     const tlsOpts = isInsecure() ? { tls: { rejectUnauthorized: false } } : {};
 
-    let response = await fetch(reqInput, {
+    let response = await fetchWithRetry(reqInput, {
       ...init,
       body,
       headers: reqHeaders,
@@ -125,6 +163,34 @@ export function createCustomFetch(getAuth: () => Promise<AuthState>, client: Cli
 
     if (response.status === 429 || response.status === 529 || response.status === 401) {
       response = await handleRetryableError(response, auth, client, reqInput, {
+        ...init,
+        body,
+        headers: reqHeaders,
+        ...tlsOpts,
+      } as BunFetchRequestInit);
+    }
+
+    for (let attempt = 0; attempt < LONG_CONTEXT_BETAS.length; attempt++) {
+      if (response.status !== 400 && response.status !== 429) break;
+
+      const cloned = response.clone();
+      const responseBody = await cloned.text();
+
+      if (!isLongContextError(responseBody)) break;
+
+      const model = modelId ?? "unknown";
+      const betaToExclude = getNextBetaToExclude(model);
+      if (!betaToExclude) break;
+
+      addExcludedBeta(model, betaToExclude);
+
+      const retryBetas = getBetasForModel(model, baseBetas);
+      const newMerged = [...new Set([...retryBetas, ...incoming])].join(",");
+      reqHeaders.set("anthropic-beta", newMerged);
+
+      log.info("Retrying without excluded beta", { modelId: model, excludedBeta: betaToExclude });
+
+      response = await fetchWithRetry(reqInput, {
         ...init,
         body,
         headers: reqHeaders,
@@ -144,6 +210,37 @@ export function createCustomFetch(getAuth: () => Promise<AuthState>, client: Cli
 
     return response;
   };
+}
+
+async function fetchWithRetry(
+  input: RequestInfo | URL,
+  init?: BunFetchRequestInit,
+  retries = 3,
+): Promise<Response> {
+  for (let i = 0; i < retries; i++) {
+    const res = await fetch(input, init as RequestInit);
+    if ((res.status === 429 || res.status === 529) && i < retries - 1) {
+      const retryAfter = res.headers.get("retry-after");
+      const parsed = retryAfter ? parseInt(retryAfter, 10) : NaN;
+      const delay = Number.isNaN(parsed) ? (i + 1) * 2000 : parsed * 1000;
+      if (delay > getMaxRetryDelayMs()) {
+        log.warn("Rate limit delay exceeds cap, returning immediately", {
+          status: res.status,
+          delayMs: delay,
+        });
+        return res;
+      }
+      log.info("Rate limited, retrying", {
+        status: res.status,
+        attempt: i + 1,
+        delayMs: delay,
+      });
+      await new Promise((r) => setTimeout(r, delay));
+      continue;
+    }
+    return res;
+  }
+  return fetch(input, init as RequestInit);
 }
 
 function hasJsonContentType(contentType: string | null): boolean {
@@ -199,10 +296,6 @@ async function refreshAuth(
 ): Promise<void> {
   let refreshed = false;
 
-  // Re-read auth right before the refresh POST. The outer snapshot may be
-  // stale if another request rotated the token between getAuth() and here;
-  // posting the stale refresh token would 400 and force our fallback chain
-  // for no good reason.
   const refreshToken = await (async () => {
     try {
       const latest = await getAuth();
@@ -291,7 +384,6 @@ async function handleRetryableError(
     responseBody = await response.text();
   } catch {}
 
-  // long context and billing 429s are not fixable by swapping credentials
   if (
     response.status === 429 &&
     (isLongContextError(responseBody) || isBillingError(responseBody))
